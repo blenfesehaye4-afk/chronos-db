@@ -1,4 +1,4 @@
-"""LSM-Tree storage engine coordinating MemTable, WAL, SSTables, and Compaction."""
+"""LSM-Tree storage engine coordinating MemTable, WAL, SSTables, MVCC, and Compaction."""
 
 import os
 import threading
@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 from .memtable import MemTable
+from .mvcc import MVCCStore, Transaction
 from .sstable import SSTableReader, SSTableWriter
 from .wal import WriteAheadLog
 
 
 class ChronosEngine:
-    """Log-Structured Merge (LSM) Tree Key-Value Engine with ACID durability."""
+    """Log-Structured Merge (LSM) Tree Key-Value Engine with ACID durability & MVCC."""
 
     def __init__(
         self,
@@ -30,6 +31,7 @@ class ChronosEngine:
         self.wal = WriteAheadLog(self.wal_path)
         self.memtable = MemTable(max_bytes=self.memtable_max_bytes)
         self.sstables: List[SSTableReader] = []
+        self.mvcc = MVCCStore()
 
         self._load_existing_sstables()
         self._recover_from_wal()
@@ -41,8 +43,7 @@ class ChronosEngine:
             try:
                 reader = SSTableReader(sst)
                 self.sstables.append(reader)
-            except Exception as e:
-                # Corrupt SSTable log/skip
+            except Exception:
                 pass
 
     def _recover_from_wal(self) -> None:
@@ -53,6 +54,10 @@ class ChronosEngine:
                 self.memtable.delete(key)
             else:
                 self.memtable.put(key, val or b"")
+
+    def begin_transaction(self) -> Transaction:
+        """Create a new ACID transaction with Snapshot Isolation."""
+        return self.mvcc.begin_transaction()
 
     def put(self, key: str, value: Union[str, bytes]) -> None:
         """Insert or update a key-value record."""
@@ -88,7 +93,6 @@ class ChronosEngine:
     def delete(self, key: str) -> bool:
         """Mark a key as deleted via tombstone record."""
         with self._lock:
-            # Check existence
             exists = self.get(key) is not None
             self.wal.append(key, None, is_tombstone=True)
             self.memtable.delete(key)
@@ -106,7 +110,6 @@ class ChronosEngine:
     ) -> List[Tuple[str, bytes]]:
         """Range scan keys lexicographically with tombstone filtering."""
         with self._lock:
-            # Merge records across MemTable and SSTables, giving priority to newest versions
             merged: Dict[str, Tuple[Optional[bytes], bool]] = {}
 
             # Oldest to newest SSTables
@@ -118,7 +121,6 @@ class ChronosEngine:
             for k, v, is_tomb in self.memtable.items():
                 merged[k] = (v, is_tomb)
 
-            # Filter range and tombstones
             results = []
             for k in sorted(merged.keys()):
                 if start_key and k < start_key:
@@ -142,18 +144,13 @@ class ChronosEngine:
         timestamp_ms = int(time.time() * 1000)
         sst_path = self.data_dir / f"sstable_{timestamp_ms}.sst"
 
-        # Write SSTable
         SSTableWriter.write(sst_path, entries)
         new_reader = SSTableReader(sst_path)
 
-        # Prepend new SSTable to list (newest first)
         self.sstables.insert(0, new_reader)
-
-        # Clear MemTable and truncate WAL
         self.memtable.clear()
         self.wal.truncate()
 
-        # Check compaction threshold
         if len(self.sstables) >= self.compaction_threshold:
             self.compact()
 
@@ -166,12 +163,10 @@ class ChronosEngine:
                 return None
 
             merged: Dict[str, Tuple[Optional[bytes], bool]] = {}
-            # Oldest to newest
             for sst in reversed(self.sstables):
                 for k, v, is_tomb in sst.scan_all():
                     merged[k] = (v, is_tomb)
 
-            # Purge tombstones during full compaction
             compacted_entries = [
                 (k, v, is_tomb) for k, (v, is_tomb) in merged.items()
                 if not is_tomb and v is not None
@@ -182,7 +177,6 @@ class ChronosEngine:
             SSTableWriter.write(compact_path, compacted_entries)
             compact_reader = SSTableReader(compact_path)
 
-            # Close and remove old SSTable files
             old_sstables = list(self.sstables)
             self.sstables = [compact_reader]
 

@@ -1,17 +1,19 @@
-"""AsyncIO TCP Wire Protocol Server & Client for ChronosDB."""
+"""AsyncIO TCP Wire Protocol Server & Client for ChronosDB with RESP & plain text."""
 
 import asyncio
 import json
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .engine import ChronosEngine
+from .mvcc import Transaction
+from .resp import RESPParser
 
 logger = logging.getLogger("chronos.server")
 
 
 class ChronosServer:
-    """High-throughput async TCP server exposing ChronosDB key-value engine."""
+    """High-throughput async TCP server supporting plain commands and RESP wire protocol."""
 
     def __init__(self, engine: ChronosEngine, host: str = "127.0.0.1", port: int = 6380):
         self.engine = engine
@@ -21,93 +23,122 @@ class ChronosServer:
         self._is_running = False
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Parse and execute client commands."""
+        buffer = bytearray()
+        active_txn: Optional[Transaction] = None
+
         while self._is_running:
-            line = await reader.readline()
-            if not line:
+            chunk = await reader.read(4096)
+            if not chunk:
                 break
+            buffer.extend(chunk)
 
-            cmd_line = line.decode("utf-8").strip()
-            if not cmd_line:
-                continue
-
-            parts = cmd_line.split(" ", 2)
-            cmd = parts[0].upper()
-
-            try:
-                if cmd == "PING":
-                    writer.write(b"+PONG\r\n")
-
-                elif cmd == "SET":
-                    if len(parts) < 3:
-                        writer.write(b"-ERR wrong number of arguments for 'SET'\r\n")
-                    else:
-                        key = parts[1]
-                        val = parts[2]
-                        self.engine.put(key, val)
-                        writer.write(b"+OK\r\n")
-
-                elif cmd == "GET":
-                    if len(parts) < 2:
-                        writer.write(b"-ERR wrong number of arguments for 'GET'\r\n")
-                    else:
-                        key = parts[1]
-                        res = self.engine.get(key)
-                        if res is None:
-                            writer.write(b"$-1\r\n")
-                        else:
-                            writer.write(f"${len(res)}\r\n".encode("utf-8") + res + b"\r\n")
-
-                elif cmd == "DEL":
-                    if len(parts) < 2:
-                        writer.write(b"-ERR wrong number of arguments for 'DEL'\r\n")
-                    else:
-                        key = parts[1]
-                        deleted = self.engine.delete(key)
-                        writer.write(b":1\r\n" if deleted else b":0\r\n")
-
-                elif cmd == "SCAN":
-                    prefix = parts[1] if len(parts) > 1 and parts[1] != "*" else None
-                    limit = int(parts[2]) if len(parts) > 2 else 50
-                    results = self.engine.scan(start_key=prefix, limit=limit)
-                    payload = json.dumps([{"key": k, "value": v.decode("utf-8", errors="replace")} for k, v in results])
-                    writer.write(f"${len(payload)}\r\n{payload}\r\n".encode("utf-8"))
-
-                elif cmd == "STATS":
-                    stats = self.engine.stats()
-                    payload = json.dumps(stats)
-                    writer.write(f"${len(payload)}\r\n{payload}\r\n".encode("utf-8"))
-
-                elif cmd == "COMPACT":
-                    self.engine.compact()
-                    writer.write(b"+OK\r\n")
-
-                elif cmd == "QUIT":
-                    writer.write(b"+OK\r\n")
-                    await writer.drain()
+            while buffer:
+                tokens, consumed = RESPParser.parse_command(bytes(buffer))
+                if not tokens or consumed == 0:
                     break
+                del buffer[:consumed]
 
-                else:
-                    writer.write(f"-ERR unknown command '{cmd}'\r\n".encode("utf-8"))
+                cmd = tokens[0].upper()
+                try:
+                    if cmd == "PING":
+                        writer.write(RESPParser.serialize_simple_string("PONG"))
 
-                await writer.drain()
+                    elif cmd == "SET":
+                        if len(tokens) < 3:
+                            writer.write(RESPParser.serialize_error("wrong number of arguments for 'SET'"))
+                        else:
+                            key, val = tokens[1], tokens[2]
+                            if active_txn:
+                                active_txn.put(key, val.encode("utf-8"))
+                            else:
+                                self.engine.put(key, val)
+                            writer.write(RESPParser.serialize_simple_string("OK"))
 
-            except Exception as e:
-                err_msg = f"-ERR {str(e)}\r\n".encode("utf-8")
-                writer.write(err_msg)
-                await writer.drain()
+                    elif cmd == "GET":
+                        if len(tokens) < 2:
+                            writer.write(RESPParser.serialize_error("wrong number of arguments for 'GET'"))
+                        else:
+                            key = tokens[1]
+                            res = active_txn.get(key) if active_txn else self.engine.get(key)
+                            writer.write(RESPParser.serialize_bulk_string(res))
+
+                    elif cmd == "DEL":
+                        if len(tokens) < 2:
+                            writer.write(RESPParser.serialize_error("wrong number of arguments for 'DEL'"))
+                        else:
+                            key = tokens[1]
+                            if active_txn:
+                                active_txn.delete(key)
+                                writer.write(RESPParser.serialize_integer(1))
+                            else:
+                                deleted = self.engine.delete(key)
+                                writer.write(RESPParser.serialize_integer(1 if deleted else 0))
+
+                    elif cmd == "SCAN":
+                        prefix = tokens[1] if len(tokens) > 1 and tokens[1] != "*" else None
+                        limit = int(tokens[2]) if len(tokens) > 2 else 50
+                        results = self.engine.scan(start_key=prefix, limit=limit)
+                        res_list = [f"{k}:{v.decode('utf-8', errors='replace')}" for k, v in results]
+                        writer.write(RESPParser.serialize_array(res_list))
+
+                    elif cmd == "MULTI" or cmd == "BEGIN":
+                        if active_txn:
+                            writer.write(RESPParser.serialize_error("Transaction already in progress"))
+                        else:
+                            active_txn = self.engine.begin_transaction()
+                            writer.write(RESPParser.serialize_simple_string("OK"))
+
+                    elif cmd == "EXEC" or cmd == "COMMIT":
+                        if not active_txn:
+                            writer.write(RESPParser.serialize_error("EXEC without MULTI"))
+                        else:
+                            try:
+                                active_txn.commit()
+                                active_txn = None
+                                writer.write(RESPParser.serialize_simple_string("OK"))
+                            except Exception as e:
+                                active_txn = None
+                                writer.write(RESPParser.serialize_error(f"Transaction conflict: {str(e)}"))
+
+                    elif cmd == "DISCARD" or cmd == "ROLLBACK":
+                        if not active_txn:
+                            writer.write(RESPParser.serialize_error("DISCARD without MULTI"))
+                        else:
+                            active_txn.rollback()
+                            active_txn = None
+                            writer.write(RESPParser.serialize_simple_string("OK"))
+
+                    elif cmd == "STATS":
+                        stats = self.engine.stats()
+                        writer.write(RESPParser.serialize_bulk_string(json.dumps(stats)))
+
+                    elif cmd == "COMPACT":
+                        self.engine.compact()
+                        writer.write(RESPParser.serialize_simple_string("OK"))
+
+                    elif cmd == "QUIT":
+                        writer.write(RESPParser.serialize_simple_string("OK"))
+                        await writer.drain()
+                        break
+
+                    else:
+                        writer.write(RESPParser.serialize_error(f"unknown command '{cmd}'"))
+
+                    await writer.drain()
+
+                except Exception as e:
+                    writer.write(RESPParser.serialize_error(str(e)))
+                    await writer.drain()
 
         writer.close()
         await writer.wait_closed()
 
     async def start(self) -> None:
-        """Start listening for incoming TCP client connections."""
         self._is_running = True
         self._server = await asyncio.start_server(self.handle_client, self.host, self.port)
         logger.info(f"ChronosDB server listening on {self.host}:{self.port}")
 
     async def stop(self) -> None:
-        """Gracefully stop server."""
         self._is_running = False
         if self._server:
             self._server.close()
@@ -138,7 +169,7 @@ class ChronosClient:
             length = int(line_str[1:])
             if length == -1:
                 return None
-            data = await self.reader.readexactly(length + 2)  # includes \r\n
+            data = await self.reader.readexactly(length + 2)
             return data[:-2].decode("utf-8")
 
         return line_str
@@ -157,9 +188,17 @@ class ChronosClient:
         res = await self._send_cmd(f"DEL {key}")
         return res == ":1"
 
-    async def scan(self, prefix: str = "*", limit: int = 50) -> List[dict]:
-        res = await self._send_cmd(f"SCAN {prefix} {limit}")
-        return json.loads(res) if res else []
+    async def multi(self) -> bool:
+        res = await self._send_cmd("MULTI")
+        return res == "+OK"
+
+    async def exec(self) -> bool:
+        res = await self._send_cmd("EXEC")
+        return res == "+OK"
+
+    async def discard(self) -> bool:
+        res = await self._send_cmd("DISCARD")
+        return res == "+OK"
 
     async def stats(self) -> dict:
         res = await self._send_cmd("STATS")
@@ -173,3 +212,22 @@ class ChronosClient:
         if self.writer:
             self.writer.close()
             await self.writer.wait_closed()
+
+    async def scan(self, prefix: str = "*", limit: int = 50) -> List[str]:
+        if not self.writer or not self.reader:
+            raise ConnectionError("Client is not connected")
+        self.writer.write(f"SCAN {prefix} {limit}\r\n".encode("utf-8"))
+        await self.writer.drain()
+        line = await self.reader.readline()
+        line_str = line.decode("utf-8").strip()
+
+        if line_str.startswith("*"):
+            count = int(line_str[1:])
+            items = []
+            for _ in range(count):
+                len_line = await self.reader.readline()
+                str_len = int(len_line.decode("utf-8").strip()[1:])
+                data = await self.reader.readexactly(str_len + 2)
+                items.append(data[:-2].decode("utf-8"))
+            return items
+        return []

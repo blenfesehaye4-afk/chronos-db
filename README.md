@@ -5,93 +5,79 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-> **High-performance Log-Structured Merge (LSM) Tree Key-Value Engine & Async Network Server in Python.**
+> **High-performance Log-Structured Merge (LSM) Tree Key-Value Engine, MVCC ACID Transactions & RESP Wire Server in Python.**
 
-ChronosDB is an embeddable, append-only LSM-Tree storage engine featuring Write-Ahead Logging (WAL) with CRC32 checksums, memory-efficient sparse indexed SSTables, probabilistic Bloom Filters for $O(1)$ negative key skipping, size-tiered compaction, and an asynchronous TCP wire protocol server.
-
----
-
-## 🌟 Key Architecture & Features
-
-```
-[ Client Writes (PUT / DEL) ]
-              │
-              ├── 1. Append with CRC32
-              ▼
-   ┌──────────────────────┐
-   │ Write-Ahead Log (WAL)│ ➔ Durable on-disk crash protection
-   └──────────────────────┘
-              │
-              ├── 2. In-Memory Store
-              ▼
-   ┌──────────────────────┐
-   │  MemTable (RAM)      │ ➔ Sorted in-memory dictionary
-   └──────────┬───────────┘
-              │ (Threshold reached: Flush to Disk)
-              ▼
-   ┌────────────────────────────────────────────────────────┐
-   │ Immutable SSTable (Disk)                               │
-   │ ┌────────────────┬─────────────────┬─────────────────┐ │
-   │ │  Data Block    │  Sparse Index   │  Bloom Filter   │ │
-   │ │  (Sorted Key)  │  (Jump Pointers)│  (O(1) Negatives│ │
-   │ └────────────────┴─────────────────┴─────────────────┘ │
-   └──────────────────────────┬─────────────────────────────┘
-                              │
-                    [ Compaction Engine ]
-                              ▼
-                Merge SSTables & Purge Tombstones
-```
-
-- 📝 **Write-Ahead Log (WAL)**: Ensures crash durability by fsyncing records with CRC32 checksums before memory admission.
-- ⚡ **MemTable**: Fast in-memory sorted write buffer with real-time byte tracking.
-- 🗃️ **Immutable SSTables**: Binary data layout with a 44-byte footer, sparse jump indexes, and integrated Bloom Filters.
-- 🌸 **Probabilistic Bloom Filters**: Double-hashing Bloom filters for instant negative lookups with 0% false negative rate.
-- 🔄 **Size-Tiered Compaction**: Automatic background or manual compaction merging multi-generation SSTables and discarding tombstone records.
-- 🌐 **Async TCP Wire Server & REPL**: Non-blocking client connection pool supporting `PING`, `SET`, `GET`, `DEL`, `SCAN`, `STATS`, `COMPACT`.
-- 📊 **Rich CLI**: Built-in throughput benchmark suite and live terminal inspection.
+ChronosDB is an embeddable, append-only LSM-Tree storage engine featuring Write-Ahead Logging (WAL) with CRC32 checksums, Multi-Version Concurrency Control (MVCC) with Snapshot Isolation, memory-efficient sparse indexed SSTables, probabilistic Bloom Filters, size-tiered compaction, and a Redis-compatible (RESP) asynchronous TCP server.
 
 ---
 
-## 📦 Installation
+## 🌟 What's New in v0.2.0
 
-```bash
-pip install chronos-db
+- 🔒 **MVCC & Snapshot Isolation** ([`chronos_db/mvcc.py`](file:///home/moaa/Desktop/my%20programs/bibi%20github/chronos-db/chronos_db/mvcc.py)): Monotonic transaction identifiers provide consistent, point-in-time snapshot isolation. Long-running readers are never blocked by writers.
+- ⚡ **Optimistic Concurrency Control (OCC)**: Atomic `MULTI` / `EXEC` / `DISCARD` write batches with First-Committer-Wins conflict detection.
+- 📡 **RESP Wire Protocol** ([`chronos_db/resp.py`](file:///home/moaa/Desktop/my%20programs/bibi%20github/chronos-db/chronos_db/resp.py)): Fully compatible with standard Redis clients and toolchains using the RESP2 wire protocol specification.
+- 🧹 **MVCC Vacuuming**: Automated collection and purging of expired version records older than the oldest active reader snapshot.
+
+---
+
+## 🏗️ Architecture
+
 ```
-
-Or clone and install in development mode:
-
-```bash
-git clone https://github.com/blenfesehaye4-afk/chronos-db.git
-cd chronos-db
-pip install -e .[dev]
+[ Client Writes (PUT / DEL / MULTI) ]
+                 │
+                 ├── 1. Append with CRC32
+                 ▼
+      ┌──────────────────────┐
+      │ Write-Ahead Log (WAL)│ ➔ Durable on-disk crash protection
+      └──────────────────────┘
+                 │
+                 ├── 2. In-Memory Store & MVCC Snapshot
+                 ▼
+      ┌──────────────────────┐
+      │  MemTable & MVCC     │ ➔ Sorted RAM buffer & version history
+      └──────────┬───────────┘
+                 │ (Threshold reached: Flush to Disk)
+                 ▼
+      ┌────────────────────────────────────────────────────────┐
+      │ Immutable SSTable (Disk)                               │
+      │ ┌────────────────┬─────────────────┬─────────────────┐ │
+      │ │  Data Block    │  Sparse Index   │  Bloom Filter   │ │
+      │ │  (Sorted Key)  │  (Jump Pointers)│  (O(1) Negatives│ │
+      │ └────────────────┴─────────────────┴─────────────────┘ │
+      └──────────────────────────┬─────────────────────────────┘
+                                 │
+                       [ Compaction Engine ]
+                                 ▼
+                   Merge SSTables & Purge Tombstones
 ```
 
 ---
 
-## 💻 Python Quickstart (Embeddable Engine)
+## 💻 Python Quickstart (Transactions & MVCC)
 
 ```python
-from chronos_db import ChronosEngine
+from chronos_db import ChronosEngine, TransactionConflictError
 
-# Initialize engine with custom data directory
-db = ChronosEngine(data_dir="./chronos_data", memtable_max_bytes=1024 * 1024)
+db = ChronosEngine(data_dir="./chronos_data")
 
-# Set and get keys
-db.put("user:001", '{"name": "Alice", "role": "admin"}')
-val = db.get("user:001")
-print(val.decode("utf-8"))
+# 1. Direct operations
+db.put("balance:alice", "100")
+db.put("balance:bob", "50")
 
-# Range scan
-results = db.scan(start_key="user:000", end_key="user:999", limit=50)
-for k, v in results:
-    print(k, v)
+# 2. ACID Transaction with Snapshot Isolation
+txn = db.begin_transaction()
+try:
+    alice_bal = int(txn.get("balance:alice").decode())
+    bob_bal = int(txn.get("balance:bob").decode())
 
-# Delete (writes tombstone)
-db.delete("user:001")
-assert db.get("user:001") is None
+    txn.put("balance:alice", str(alice_bal - 20).encode())
+    txn.put("balance:bob", str(bob_bal + 20).encode())
+    txn.commit()
+    print("Transfer successful!")
+except TransactionConflictError:
+    txn.rollback()
+    print("Conflict detected; transaction rolled back.")
 
-# Trigger compaction
-db.compact()
 db.close()
 ```
 
@@ -99,27 +85,15 @@ db.close()
 
 ## 🖥️ Command-Line Interface (CLI)
 
-### 1. Run Storage Benchmarks
 ```bash
-chronos-db bench --ops 10000 --dir ./bench_data
-```
-
-### 2. Launch the TCP Server
-```bash
+# Launch RESP TCP server
 chronos-db server --host 127.0.0.1 --port 6380 --dir ./chronos_data
-```
 
-### 3. Connect via Interactive REPL
-```bash
+# Run write & read throughput benchmark
+chronos-db bench --ops 10000 --dir ./bench_data
+
+# Connect interactive terminal client
 chronos-db repl --host 127.0.0.1 --port 6380
-```
-```text
-chronos:6380> SET cluster:status running
-OK
-chronos:6380> GET cluster:status
-"running"
-chronos:6380> STATS
-{'memtable_entries': 1, 'memtable_bytes': 38, 'sstable_count': 1, ...}
 ```
 
 ---
