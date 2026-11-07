@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chronos-db"
-version = "0.2.0"
-description = "🗄️ ChronosDB: High-performance Log-Structured Merge (LSM) Tree key-value storage engine & network server in Python."
+version = "0.3.0"
+description = "🗄️ ChronosDB: High-performance LSM-Tree engine, MVCC ACID transactions, TTL expiration, LRU cache & Redis data structures."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
